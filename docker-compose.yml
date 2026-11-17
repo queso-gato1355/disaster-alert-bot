@@ -1,0 +1,17 @@
+services:
+  disaster-alert-bot:
+    build: .
+    image: quesogato3924/disaster-alert-bot:latest
+    container_name: disaster-alert-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Seoul
+      DB_PATH: /app/data/bot.db
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
