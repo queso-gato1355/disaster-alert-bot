@@ -102,14 +102,19 @@ def eqk_list_embed(events: list[EqkEvent], title: str, empty_text: str) -> disco
             text += f"… 외 {len(lines) - shown}건"
         e.description = text
         e.colour = _mag_color(max((ev.best for ev in events), key=lambda r: r.mt or 0))
-        latest = events[0].best
-        if latest.img:
-            e.set_thumbnail(url=latest.img)
         dom = sum(1 for ev in events if ev.best.domestic)
         e.add_field(name="합계", value=f"국내 {dom}건 · 국외 {len(events) - dom}건", inline=True)
         strongest = max((ev.best for ev in events), key=lambda r: r.mt or 0)
         mt = f"M{strongest.mt:.1f}" if strongest.mt is not None else "M?"
         e.add_field(name="최대 규모", value=f"{mt} — {strongest.loc}"[:1024], inline=True)
+        # 가장 최근 지진의 진앙 지도를 큰 이미지로 (썸네일은 너무 작게 표시됨)
+        latest = next((ev.best for ev in events if ev.best.img), None)
+        if latest:
+            when = latest.tm_eqk.strftime("%m/%d %H:%M") if latest.tm_eqk else ""
+            lmt = f"M{latest.mt:.1f}" if latest.mt is not None else "M?"
+            e.add_field(name="🗺️ 아래 지도", value=f"가장 최근 지진 · `{when}` {lmt} {latest.loc}"[:1024],
+                        inline=False)
+            e.set_image(url=latest.img)
     else:
         e.description = empty_text
     return e
