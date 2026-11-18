@@ -1,0 +1,11 @@
+{
+  "header": {
+    "resultMsg": "NORMAL SERVICE",
+    "resultCode": "00",
+    "errorMsg": null
+  },
+  "numOfRows": 5,
+  "pageNo": 1,
+  "totalCount": 0,
+  "body": null
+}
