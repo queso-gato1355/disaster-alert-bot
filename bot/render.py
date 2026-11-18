@@ -20,7 +20,7 @@ def disaster_embed(m: DisasterMsg) -> discord.Embed:
     e = discord.Embed(title=title, description=m.content[:4000], color=color,
                       timestamp=m.created)
     if m.regions:
-        e.add_field(name="수신지역", value=_clip(m.regions, 1024), inline=False)
+        e.add_field(name="수신지역", value=_clip(region_summary(m.regions), 1024), inline=False)
     e.set_footer(text="행정안전부 재난문자")
     return e
 
@@ -70,6 +70,42 @@ def event_embeds(ev: EqkEvent, include_msgs: list[DisasterMsg], include_eqk: boo
             description="🔎 기상청 지진 상세정보를 조회 중입니다… (확인되면 자동으로 추가됩니다)",
             color=0x9E9E9E))
     return embeds
+
+
+def region_summary(regions: str) -> str:
+    """전국 대상 문자는 시·도 16~17개가 나열되므로 '전국'으로 줄임."""
+    parts = [p for p in regions.split(", ") if p]
+    if len(parts) >= 15 and all(" " not in p for p in parts):
+        return f"전국 ({len(parts)}개 시·도)"
+    return regions
+
+
+def disaster_list_embed(msgs: list[DisasterMsg], title: str, empty_text: str) -> discord.Embed:
+    e = discord.Embed(title=title, color=0x546E7A)
+    if not msgs:
+        e.description = empty_text
+        return e
+    top = next((s for s in STEP_STYLE if any(m.step == s for m in msgs)), None)
+    if top:
+        e.colour = STEP_STYLE[top][0]
+    text, shown = "", 0
+    for m in msgs:
+        icon = STEP_STYLE.get(m.step, (0, "📢"))[1]
+        when = m.created.strftime("%H:%M") if m.created else "--:--"
+        body = " ".join(m.content.split())
+        ln = (f"{icon} `{when}` **{m.category or '재난'}** · {_clip(region_summary(m.regions), 40)}\n"
+              f"　{_clip(body, 110)}\n")
+        if len(text) + len(ln) > 3900:
+            break
+        text += ln
+        shown += 1
+    if shown < len(msgs):
+        text += f"… 외 {len(msgs) - shown}건"
+    e.description = text
+    counts = {s: sum(1 for m in msgs if m.step == s) for s in STEP_STYLE}
+    e.add_field(name="합계", value=" · ".join(f"{s} {n}건" for s, n in counts.items() if n)
+                or f"{len(msgs)}건", inline=False)
+    return e
 
 
 def _clip(s: str, n: int) -> str:

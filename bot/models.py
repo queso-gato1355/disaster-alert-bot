@@ -26,6 +26,11 @@ class DisasterMsg:
     regions: str
     step: str          # 위급재난 / 긴급재난 / 안전안내
     category: str      # 지진, 호우, ...
+    registered: datetime | None = None   # API 에 반영된 시각 (발송보다 약 10분 늦음)
+
+    @property
+    def available_at(self) -> datetime | None:
+        return self.registered or self.created
 
     @property
     def is_earthquake(self) -> bool:

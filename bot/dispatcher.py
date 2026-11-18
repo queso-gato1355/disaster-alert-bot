@@ -27,7 +27,7 @@ SAME_QUAKE = timedelta(seconds=90)
 REGION_ALIASES = {
     "경기": ["경기도"], "강원": ["강원도", "강원특별자치도"],
     "충북": ["충청북도"], "충남": ["충청남도"],
-    "전북": ["전라북도", "전북특별자치도"], "전남": ["전라남도"],
+    "전북": ["전라북도", "전북특별자치도"], "전남": ["전라남도", "전남광주통합특별시"],
     "경북": ["경상북도"], "경남": ["경상남도"],
     "제주": ["제주특별자치도", "제주도"], "세종": ["세종특별자치시"],
 }
@@ -47,15 +47,27 @@ def _variants(kw: str) -> list[str]:
     return out
 
 
+def region_matches(regions: str, keywords: list[str]) -> bool:
+    """수신지역 문자열이 키워드 지역을 포함하는지.
+    - '경북 상주시' → '경상북도 상주시 ' 처럼 키워드가 수신지역 안에 있거나
+    - 수신지역이 상위 지역('충청남도')이라 키워드('충남 천안시')를 덮는 경우 모두 True.
+    전국 문자는 '전국'이 아니라 시·도 16~17개가 나열되어 오므로 두 번째 경우가 필요함."""
+    if "전국" in regions:
+        return True
+    parts = [p for p in regions.split(", ") if p]
+    for kw in keywords:
+        for v in _variants(kw):
+            if v in regions or any(v.startswith(p + " ") for p in parts):
+                return True
+    return False
+
+
 def msg_passes(g: GuildConfig, m: DisasterMsg) -> bool:
     if m.is_missing_person and not g.include_missing:
         return False
     if m.step and m.step not in g.steps:
         return False
-    if not g.regions or "전국" in m.regions:
-        return True
-    # "경북 상주시" 처럼 공백이 들어간 키워드도 정식명으로 바꿔서 비교
-    return any(v in m.regions for kw in g.regions for v in _variants(kw))
+    return not g.regions or region_matches(m.regions, g.regions)
 
 
 def eqk_passes(g: GuildConfig, r: EqkReport | None) -> bool:

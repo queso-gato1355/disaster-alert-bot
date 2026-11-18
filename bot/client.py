@@ -12,6 +12,7 @@ from discord import app_commands
 from . import render, timeutil
 from .config import Config
 from .dispatcher import Dispatcher
+from .disaster_commands import build_disaster_commands
 from .eqk_commands import build_eqk_commands
 from .models import DisasterMsg, EqkReport
 from .pollers import DisasterPoller, EqkPoller
@@ -40,6 +41,7 @@ class AlertBot(discord.Client):
         self._tasks: list[asyncio.Task] = []
         self.tree.add_command(build_commands(self))
         self.tree.add_command(build_eqk_commands(self))
+        self.tree.add_command(build_disaster_commands(self))
 
     async def setup_hook(self) -> None:
         await self.storage.open()
@@ -53,7 +55,8 @@ class AlertBot(discord.Client):
         if cfg_on(self):
             self.dispatcher.request_disaster_burst = self.disaster_poller.burst_short
         else:
-            log.warning("재난문자 기능 비활성화 상태 (DISASTER_ENABLED=false) — 지진정보만 동작")
+            log.warning("재난문자 기능 비활성화 상태 (CBS_SERVICE_KEY 없음 또는 DISASTER_ENABLED=false) "
+                        "— 지진정보만 동작")
         await self.tree.sync()
 
     async def on_ready(self) -> None:
@@ -162,7 +165,7 @@ async def dashboard_embed(bot: AlertBot, guild: discord.Guild) -> discord.Embed:
     # 봇 공통 상태
     lines = []
     if not cfg_on(bot):
-        lines.append("⏸️ **재난문자(행안부)** 비활성화 — API 승인 대기 중 (지진정보만 공지)")
+        lines.append("⏸️ **재난문자(행안부)** 비활성화 — 지진정보만 공지")
     pairs = ((bot.disaster_poller, bot.disaster_quota),) if cfg_on(bot) else ()
     for p, q in pairs + ((bot.eqk_poller, bot.eqk_quota),):
         used = await q.used()

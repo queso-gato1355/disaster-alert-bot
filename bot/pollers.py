@@ -182,52 +182,64 @@ class EqkPoller(Poller):
 class DisasterPoller(Poller):
     name = "재난문자(행안부)"
     source = "disaster"
-    ROWS = 50
+    ROWS = 100
+    MAX_PAGES = 10            # 한 번의 조회에서 읽을 최대 페이지 (하루 1,000건)
+    # REG_YMD 가 CRT_DT 보다 약 10분 늦으므로, 자정 직후엔 전날 문자도 함께 조회
+    # (crtDt 는 '그 날짜 이후' 조건이라 전날 날짜를 주면 오늘 문자도 포함됨)
+    LOOKBACK = timedelta(minutes=30)
+    CACHE_TTL = timedelta(hours=24)
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
-        self._ascending: bool | None = None    # API 정렬 순서 (첫 응답에서 감지)
-        self._prev_day_checked: str | None = None
+        # 정렬 순서가 일정하지 않으므로 전체를 읽어야 함.
+        # totalCount 가 그대로면 새 문자가 없으므로 첫 페이지만 확인.
+        self._totals: dict[str, int] = {}
+        self.cache: dict[str, DisasterMsg] = {}     # 수동 조회용 (최근 24시간)
 
     def burst_short(self) -> None:
-        """국내 유감지진 발생 시 재난문자를 빨리 받기 위해 30초 간격 4분."""
-        self.burst(240, 30)
+        """국내 유감지진 발생 시 재난문자를 빨리 받기 위해 45초 간격 15분.
+        (재난문자는 발송 약 10분 뒤에 API 에 반영됨)"""
+        self.burst(900, 45)
 
     async def poll(self) -> None:
-        today = timeutil.ymd()
-        msgs = await self._fetch_latest(today)
-        now = timeutil.now()
-        # 자정 직후 1회: 전날 23시대 마지막 문자 누락 방지
-        if now.hour == 0 and self._prev_day_checked != today and \
-                await self.quota.acquire(burst=True):
-            self._prev_day_checked = today
-            msgs += await self._fetch_latest(timeutil.ymd(now - timedelta(days=1)))
+        crt_dt = timeutil.ymd(timeutil.now() - self.LOOKBACK)
+        msgs = await self._fetch_all(crt_dt)
         await self._process(msgs)
 
-    async def _fetch_latest(self, crt_dt: str) -> list[DisasterMsg]:
+    async def _fetch_all(self, crt_dt: str) -> list[DisasterMsg]:
         msgs, total = await apis.fetch_disaster_page(self.session, self.key, crt_dt, 1, self.ROWS)
-        if self._ascending is None and len(msgs) >= 2:
-            self._ascending = _sn(msgs[0]) < _sn(msgs[-1])
-            log.info("재난문자 API 정렬: %s", "오래된순" if self._ascending else "최신순")
-        if self._ascending and total > self.ROWS:
-            # 오래된순이면 마지막 페이지에 최신 문자가 있다 (추가 호출 1회)
-            last = (total + self.ROWS - 1) // self.ROWS
-            if await self.quota.acquire(burst=True):
+        pages = min(self.MAX_PAGES, (total + self.ROWS - 1) // self.ROWS)
+        if pages > 1 and total != self._totals.get(crt_dt):
+            for page in range(2, pages + 1):
+                if not await self.quota.acquire(burst=True):
+                    log.warning("재난문자 %d/%d 페이지: 호출 한도 부족으로 중단", page, pages)
+                    return msgs     # total 을 기록하지 않아 다음 조회 때 다시 읽음
                 more, _ = await apis.fetch_disaster_page(
-                    self.session, self.key, crt_dt, last, self.ROWS)
-                msgs = more
+                    self.session, self.key, crt_dt, page, self.ROWS)
+                msgs += more
+        self._totals = {crt_dt: total}
         return msgs
 
     async def _process(self, msgs: list[DisasterMsg]) -> None:
         msgs.sort(key=_sn)
         now = timeutil.now()
         for m in msgs:
+            self.cache[m.sn] = m
             if not await self._is_new(m.sn):
                 continue
-            if m.created and now - m.created > self.stale:
-                continue
+            t = m.available_at
+            if t and now - t > self.stale:
+                continue        # 재시작 등으로 놓친 오래된 문자는 공지하지 않음
             log.info("새 재난문자 SN=%s [%s/%s] %s", m.sn, m.step, m.category, m.regions[:40])
             await self.dispatcher.handle_disaster(m)
+        cutoff = now - self.CACHE_TTL
+        self.cache = {k: v for k, v in self.cache.items()
+                      if not v.created or v.created >= cutoff}
+
+    def recent(self) -> list[DisasterMsg]:
+        """수동 조회용. 발송 시각 최신순 (API 호출 없음)."""
+        return sorted(self.cache.values(),
+                      key=lambda m: m.created.timestamp() if m.created else 0, reverse=True)
 
 
 def _sn(m: DisasterMsg):

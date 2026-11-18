@@ -119,6 +119,16 @@ async def fetch_eqk(session: aiohttp.ClientSession, key: str, rows: int = 100,
 
 
 # ---------------------------------------------------------------- 행안부 재난문자
+# 실제 응답 (2026-11-18 확인):
+# {"header": {"resultCode": "00", "resultMsg": "NORMAL SERVICE", "errorMsg": null},
+#  "numOfRows": 3, "pageNo": 1, "totalCount": 15,
+#  "body": [{"SN": 270101, "CRT_DT": "2026/11/18 12:00:20", "REG_YMD": "2026/11/18 12:10:10.000000000",
+#            "MSG_CN": "...", "RCPTN_RGN_NM": "강원특별자치도  ,경기도  ,...", "EMRG_STEP_NM": "안전안내",
+#            "DST_SE_NM": "한파", ...}]}
+# - crtDt 는 '그 날짜 이후' 조건 (전날을 주면 오늘 문자도 포함)
+# - 정렬 순서가 일정하지 않음 (SN/시각 순 아님) → 전체를 읽어 SN 으로 중복 제거
+# - REG_YMD(API 반영 시각)가 CRT_DT(발송 시각)보다 약 10분 늦음
+# - 데이터 없음: resultCode 00 + totalCount 0 / 키 오류: resultCode 30
 def _safety_items(data: dict) -> tuple[list[dict], int]:
     header = data.get("header") or {}
     code = str(header.get("resultCode", "00"))
@@ -133,14 +143,21 @@ def _safety_items(data: dict) -> tuple[list[dict], int]:
     return list(body), total
 
 
+def _regions(raw) -> str:
+    """'강원특별자치도  ,경기도  ,충청남도 천안시 동남구 ' → '강원특별자치도, 경기도, 충청남도 천안시 동남구'"""
+    parts = (" ".join(p.split()) for p in str(raw or "").split(","))
+    return ", ".join(dict.fromkeys(p for p in parts if p))
+
+
 def _to_msg(it: dict) -> DisasterMsg:
     return DisasterMsg(
         sn=str(it.get("SN") or it.get("sn") or ""),
         created=timeutil.parse(it.get("CRT_DT") or it.get("crtDt")),
         content=str(it.get("MSG_CN") or it.get("msgCn") or "").strip(),
-        regions=str(it.get("RCPTN_RGN_NM") or it.get("rcptnRgnNm") or ""),
-        step=str(it.get("EMRG_STEP_NM") or it.get("emrgStepNm") or ""),
-        category=str(it.get("DST_SE_NM") or it.get("dstSeNm") or ""),
+        regions=_regions(it.get("RCPTN_RGN_NM") or it.get("rcptnRgnNm")),
+        step=str(it.get("EMRG_STEP_NM") or it.get("emrgStepNm") or "").strip(),
+        category=str(it.get("DST_SE_NM") or it.get("dstSeNm") or "").strip(),
+        registered=timeutil.parse(str(it.get("REG_YMD") or "").split(".")[0] or None),
     )
 
 

@@ -24,7 +24,7 @@ class Config:
     discord_token: str
     data_go_kr_key: str        # 기상청 지진정보 (URL 인코딩된 키)
     safety_key: str            # 행안부 재난문자 (safetydata.go.kr)
-    disaster_enabled: bool     # 재난문자 기능 on/off (키 승인 전에는 false)
+    disaster_enabled: bool     # 재난문자 기능 on/off (기본: 키가 있으면 켜짐)
     db_path: str
     admin_channel_id: int | None
 
@@ -44,11 +44,13 @@ class Config:
 
 def load() -> Config:
     admin = _env("ADMIN_CHANNEL_ID")
+    safety_key = _env("CBS_SERVICE_KEY")
     return Config(
         discord_token=_env("DISCORD_TOKEN"),
         data_go_kr_key=_env("DATA_GO_KR_KEY"),
-        safety_key=_env("CBS_SERVICE_KEY"),
-        disaster_enabled=_env("DISASTER_ENABLED", "false").lower() in ("1", "true", "yes", "on"),
+        safety_key=safety_key,
+        disaster_enabled=bool(safety_key) and
+        _env("DISASTER_ENABLED", "true").lower() in ("1", "true", "yes", "on"),
         db_path=_env("DB_PATH", "data/bot.db"),
         admin_channel_id=int(admin) if admin else None,
         disaster_daily_limit=_int("DISASTER_DAILY_LIMIT", 1000),
