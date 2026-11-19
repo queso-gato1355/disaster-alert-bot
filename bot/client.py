@@ -14,7 +14,7 @@ from .config import Config
 from .dispatcher import Dispatcher
 from .disaster_commands import build_disaster_commands
 from .eqk_commands import build_eqk_commands
-from .models import DisasterMsg, EqkReport
+from .models import EQK_LEVELS, DisasterMsg, EqkReport
 from .pollers import DisasterPoller, EqkPoller
 from .quota import Quota
 from .storage import Storage
@@ -114,6 +114,18 @@ def _onoff(v: bool) -> str:
     return "✅" if v else "❌"
 
 
+EQK_LEVEL_DESC = {
+    1: "국내 진도 Ⅴ 이상 (국외 지진으로 국내 진도 Ⅴ 이상 포함)",
+    2: "국내 진도 Ⅲ 이상 (국외 지진으로 국내 진도 Ⅲ 이상 포함)",
+    3: "기상청이 발표하는 모든 지진 (국내·국외)",
+    0: "꺼짐 (지진 재난문자에 붙는 상세정보만)",
+}
+
+
+def _eqk_level_text(level: int) -> str:
+    return EQK_LEVEL_DESC.get(level, f"알 수 없는 등급 {level}")
+
+
 async def dashboard_embed(bot: AlertBot, guild: discord.Guild) -> discord.Embed:
     g = await bot.storage.guild(guild.id)
     active = g.channel_id is not None
@@ -147,7 +159,7 @@ async def dashboard_embed(bot: AlertBot, guild: discord.Guild) -> discord.Embed:
                 value="\n".join(f"{_onoff(s in g.steps)} {s}" for s in STEPS)
                 + f"\n{_onoff(g.include_missing)} 실종알림", inline=True)
     e.add_field(name="지진정보",
-                value=f"국내 M{g.eqk_domestic_min:g} 이상\n국외 M{g.eqk_overseas_min:g} 이상"
+                value=f"**{EQK_LEVELS.get(g.eqk_level, ('?',))[0]}**\n{_eqk_level_text(g.eqk_level)}"
                       + "\n(지진 재난문자엔 항상 상세정보 첨부)", inline=True)
     mentions = "\n".join(f"{k} → <@&{v}>" for k, v in g.mentions.items()) or "없음"
     e.add_field(name="멘션", value=mentions, inline=False)
@@ -236,7 +248,7 @@ def build_commands(bot: AlertBot) -> app_commands.Group:
             sorted({x.strip() for x in 지역.split(",") if x.strip()})[:25]
         await bot.storage.save_guild(g)
         await reply(inter, f"✅ 수신 지역: {', '.join(g.regions) or '전국 (필터 없음)'}\n"
-                           "※ '전국' 대상 문자와 기준 이상 규모의 지진정보는 필터와 관계없이 공지됩니다.")
+                           "※ '전국' 대상 문자와 지진 등급 기준을 넘는 지진정보는 필터와 관계없이 공지됩니다.")
 
     @grp.command(name="단계", description="공지할 재난문자 종류 (지정하지 않은 항목은 그대로 유지)")
     async def set_steps(inter: discord.Interaction, 위급재난: bool | None = None,
@@ -266,15 +278,16 @@ def build_commands(bot: AlertBot) -> app_commands.Group:
         await bot.storage.save_guild(g)
         await reply(inter, f"✅ {종류.value} → {역할.mention if 역할 else '멘션 없음'}")
 
-    @grp.command(name="지진", description="재난문자와 별도로 공지할 지진의 최소 규모")
-    async def set_eqk(inter: discord.Interaction,
-                      국내최소규모: app_commands.Range[float, 0, 10] = 2.0,
-                      국외최소규모: app_commands.Range[float, 0, 10] = 6.0):
+    @grp.command(name="지진", description="재난문자와 별도로 공지할 지진 등급 (국내 진도 기준)")
+    @app_commands.choices(등급=[
+        app_commands.Choice(name=f"{name} — {EQK_LEVEL_DESC[v]}"[:100], value=v)
+        for v, (name, _) in EQK_LEVELS.items()])
+    async def set_eqk(inter: discord.Interaction, 등급: app_commands.Choice[int]):
         g = await bot.storage.guild(inter.guild_id)
-        g.eqk_domestic_min, g.eqk_overseas_min = 국내최소규모, 국외최소규모
+        g.eqk_level = 등급.value
         await bot.storage.save_guild(g)
-        await reply(inter, f"✅ 국내 M{국내최소규모:g} 이상, 국외 M{국외최소규모:g} 이상 지진을 공지합니다. "
-                           "(10으로 설정하면 사실상 끔)")
+        await reply(inter, f"✅ 지진 공지 등급: **{EQK_LEVELS[등급.value][0]}** — "
+                           f"{_eqk_level_text(등급.value)}")
 
     @grp.command(name="미리보기", description="공지 형식 미리보기 (예시 데이터, 나에게만 보임)")
     async def preview(inter: discord.Interaction):

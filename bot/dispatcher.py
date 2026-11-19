@@ -10,7 +10,7 @@ from typing import Callable
 import discord
 
 from . import render, timeutil
-from .models import DisasterMsg, EqkEvent, EqkReport, PRELIMINARY_FC
+from .models import EQK_LEVELS, DisasterMsg, EqkEvent, EqkReport, PRELIMINARY_FC
 from .storage import GuildConfig, Storage
 
 log = logging.getLogger(__name__)
@@ -71,9 +71,16 @@ def msg_passes(g: GuildConfig, m: DisasterMsg) -> bool:
 
 
 def eqk_passes(g: GuildConfig, r: EqkReport | None) -> bool:
-    if r is None or r.mt is None:
+    """재난문자 없이 지진정보만으로 공지할지 (서버 지진 등급 기준).
+    등급 1·2 는 국내 관측 최대진도로 판단 — 국외 지진이라도 국내 진도가 기준 이상이면 공지.
+    진도가 아직 없는 속보는 상세정보(진도 포함)가 들어오면 그때 공지된다."""
+    if r is None or g.eqk_level not in EQK_LEVELS or g.eqk_level == 0:
         return False
-    return r.mt >= (g.eqk_domestic_min if r.domestic else g.eqk_overseas_min)
+    _, min_int = EQK_LEVELS[g.eqk_level]
+    if min_int is None:          # 모든 지진
+        return True
+    inten = r.max_intensity
+    return inten is not None and inten >= min_int
 
 
 class Dispatcher:

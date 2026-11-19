@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -16,6 +17,33 @@ FC_TP = {
 DOMESTIC_FC = {3, 5, 11, 13, 14}
 DETAILED_FC = {2, 3, 5, 13}      # 수동분석/정밀분석 → 더 이상 기다릴 필요 없음
 PRELIMINARY_FC = {11, 12, 14}    # 자동추정 → 상세정보가 뒤따름
+
+# 서버별 지진 공지 등급: 값 → (표시 이름, 최소 국내 진도 / None = 진도 무관)
+# 국외 지진도 국내에서 관측된 진도(inT)로 판단한다.
+EQK_LEVELS: dict[int, tuple[str, int | None]] = {
+    1: ("진도 Ⅴ 이상", 5),
+    2: ("진도 Ⅲ 이상", 3),
+    3: ("모든 지진", None),
+    0: ("끄기", None),
+}
+EQK_LEVEL_DEFAULT = 2
+
+# 진도(inT) 표기: "최대진도 Ⅳ(경북,충북),Ⅲ(강원,세종,전북)" 처럼 로마숫자. ASCII/아라비아 숫자도 허용
+_ROMAN_UNI = {chr(0x2160 + i): i + 1 for i in range(12)}          # Ⅰ..Ⅻ
+_ROMAN_ASCII = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7,
+                "VIII": 8, "IX": 9, "X": 10, "XI": 11, "XII": 12}
+_INT_RE = re.compile(r"[Ⅰ-Ⅻ]|(?<![A-Za-z])(?:XII|XI|IX|X|VIII|VII|VI|IV|V|III|II|I)(?![A-Za-z])"
+                     r"|(?<![\d.])(?:1[0-2]|[1-9])(?![\d.])")
+
+
+def parse_max_intensity(text: str) -> int | None:
+    """진도 문자열에서 가장 큰 진도(1~12)를 뽑는다. 진도 정보가 없으면 None."""
+    best = None
+    for m in _INT_RE.finditer(text or ""):
+        tok = m.group(0)
+        v = _ROMAN_UNI.get(tok) or _ROMAN_ASCII.get(tok) or int(tok)
+        best = v if best is None else max(best, v)
+    return best
 
 
 @dataclass
@@ -68,6 +96,11 @@ class EqkReport:
     @property
     def domestic(self) -> bool:
         return self.fc_tp in DOMESTIC_FC
+
+    @property
+    def max_intensity(self) -> int | None:
+        """국내에서 관측(국외 지진은 국내 영향)된 최대 진도. 없으면 None."""
+        return parse_max_intensity(self.intensity)
 
     @property
     def kind(self) -> str:

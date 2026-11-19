@@ -68,11 +68,17 @@ MIGRATIONS: list[str] = [
     );
     CREATE INDEX IF NOT EXISTS idx_deliveries_guild ON deliveries(guild_id, sent_at DESC);
     """,
+    # v2: 지진 공지 기준을 규모(eqk_*_min) → 진도 등급(eqk_level)으로 변경
+    #     1=국내 진도 Ⅴ 이상, 2=진도 Ⅲ 이상, 3=모든 지진, 0=끄기. 옛 컬럼은 남겨두되 사용하지 않음
+    """
+    ALTER TABLE guilds ADD COLUMN eqk_level INTEGER NOT NULL DEFAULT 2;
+    UPDATE guilds SET eqk_level = 0 WHERE eqk_domestic_min >= 10 AND eqk_overseas_min >= 10;
+    """,
 ]
 
 STEP_COLUMNS = {"위급재난": "step_critical", "긴급재난": "step_emergency", "안전안내": "step_safety"}
 _GUILD_COLS = ("guild_id, name, channel_id, step_critical, step_emergency, step_safety, "
-               "include_missing, eqk_domestic_min, eqk_overseas_min")
+               "include_missing, eqk_level")
 
 
 @dataclass
@@ -82,8 +88,7 @@ class GuildConfig:
     channel_id: int | None = None
     steps: list[str] = field(default_factory=lambda: ["위급재난", "긴급재난"])
     include_missing: bool = False
-    eqk_domestic_min: float = 2.0
-    eqk_overseas_min: float = 6.0
+    eqk_level: int = 2        # models.EQK_LEVELS
     regions: list[str] = field(default_factory=list)      # 비어 있으면 전국
     mentions: dict[str, int] = field(default_factory=dict)
 
@@ -213,10 +218,10 @@ class Storage:
         await self.ensure_guild(g.guild_id, g.name)
         await self.db.execute(
             "UPDATE guilds SET channel_id=?, step_critical=?, step_emergency=?, step_safety=?, "
-            "include_missing=?, eqk_domestic_min=?, eqk_overseas_min=?, updated_at=? "
+            "include_missing=?, eqk_level=?, updated_at=? "
             "WHERE guild_id=?",
             (g.channel_id, *(int(s in g.steps) for s in STEP_COLUMNS),
-             int(g.include_missing), g.eqk_domestic_min, g.eqk_overseas_min, time.time(),
+             int(g.include_missing), g.eqk_level, time.time(),
              g.guild_id),
         )
         await self.db.execute("DELETE FROM guild_regions WHERE guild_id=?", (g.guild_id,))
@@ -275,5 +280,4 @@ class Storage:
     def _row(r) -> GuildConfig:
         steps = [s for s, flag in zip(STEP_COLUMNS, r[3:6]) if flag]
         return GuildConfig(guild_id=r[0], name=r[1], channel_id=r[2], steps=steps,
-                           include_missing=bool(r[6]), eqk_domestic_min=r[7],
-                           eqk_overseas_min=r[8])
+                           include_missing=bool(r[6]), eqk_level=r[7])

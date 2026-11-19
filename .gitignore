@@ -3,4 +3,4 @@ data/
 __pycache__/
 *.pyc
 .venv/
-./doc/safetydata-api-research
+doc/safetydata-api-research/
