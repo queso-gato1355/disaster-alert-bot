@@ -25,6 +25,7 @@ class Config:
     data_go_kr_key: str        # 기상청 지진정보 (URL 인코딩된 키)
     safety_key: str            # 행안부 재난문자 (safetydata.go.kr)
     disaster_enabled: bool     # 재난문자 기능 on/off (기본: 키가 있으면 켜짐)
+    disaster_off_reason: str   # 꺼져 있을 때 그 이유 (켜져 있으면 빈 문자열)
     db_path: str
     admin_channel_id: int | None
 
@@ -42,15 +43,34 @@ class Config:
     stale_minutes: int
 
 
+def _disaster_state(safety_key: str) -> tuple[bool, str]:
+    """(켜짐 여부, 꺼진 이유)."""
+    flag = _env("DISASTER_ENABLED", "true").lower()
+    if not safety_key:
+        # 'CBS_SERVICE_KEY = 값' 처럼 = 앞에 공백이 있으면 Docker 는 변수 이름에 공백을 포함시킨다
+        near = [k for k in os.environ
+                if k != "CBS_SERVICE_KEY" and k.strip().upper() == "CBS_SERVICE_KEY"]
+        if near:
+            return False, (f"CBS_SERVICE_KEY 이름이 잘못됨 ({near[0]!r}) — "
+                           "'=' 앞뒤 공백을 지우고 컨테이너를 다시 만드세요")
+        if "CBS_SERVICE_KEY" in os.environ:
+            return False, "CBS_SERVICE_KEY 값이 비어 있음"
+        return False, "CBS_SERVICE_KEY 가 컨테이너 환경변수에 없음"
+    if flag not in ("1", "true", "yes", "on"):
+        return False, f"DISASTER_ENABLED={flag} 로 꺼져 있음 — 줄을 지우거나 true 로 바꾸세요"
+    return True, ""
+
+
 def load() -> Config:
     admin = _env("ADMIN_CHANNEL_ID")
     safety_key = _env("CBS_SERVICE_KEY")
+    enabled, off_reason = _disaster_state(safety_key)
     return Config(
         discord_token=_env("DISCORD_TOKEN"),
         data_go_kr_key=_env("DATA_GO_KR_KEY"),
         safety_key=safety_key,
-        disaster_enabled=bool(safety_key) and
-        _env("DISASTER_ENABLED", "true").lower() in ("1", "true", "yes", "on"),
+        disaster_enabled=enabled,
+        disaster_off_reason=off_reason,
         db_path=_env("DB_PATH", "data/bot.db"),
         admin_channel_id=int(admin) if admin else None,
         disaster_daily_limit=_int("DISASTER_DAILY_LIMIT", 1000),

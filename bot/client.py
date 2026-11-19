@@ -9,7 +9,7 @@ import aiohttp
 import discord
 from discord import app_commands
 
-from . import render, timeutil
+from . import __version__, render, timeutil
 from .config import Config
 from .dispatcher import Dispatcher
 from .disaster_commands import build_disaster_commands
@@ -55,12 +55,12 @@ class AlertBot(discord.Client):
         if cfg_on(self):
             self.dispatcher.request_disaster_burst = self.disaster_poller.burst_short
         else:
-            log.warning("재난문자 기능 비활성화 상태 (CBS_SERVICE_KEY 없음 또는 DISASTER_ENABLED=false) "
-                        "— 지진정보만 동작")
+            log.warning("재난문자 기능 비활성화: %s — 지진정보만 동작", self.cfg.disaster_off_reason)
         await self.tree.sync()
 
     async def on_ready(self) -> None:
-        log.info("로그인: %s (서버 %d개)", self.user, len(self.guilds))
+        log.info("로그인: %s (서버 %d개, v%s, 재난문자 %s)", self.user, len(self.guilds), __version__,
+                 "켜짐" if cfg_on(self) else "꺼짐")
         for g in self.guilds:
             await self.storage.ensure_guild(g.id, g.name)
         if not self._tasks:   # 재연결 시 중복 실행 방지

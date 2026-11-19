@@ -106,7 +106,9 @@ API 호출은 서버 수와 상관없이 한 번만 하고, 받은 결과를 서
 - Container Manager UI: **이미지** 탭에서 `quesogato3924/disaster-alert-bot`에 '업데이트 가능'이 표시되면 업데이트한 뒤, 프로젝트를 중지했다가 다시 시작합니다.
 - 버전을 고정하고 싶으면 yml의 `:latest` 대신 `:1.0.0`처럼 태그를 지정하세요. 업데이트할 때 태그만 바꾸면 되므로 어떤 버전이 돌고 있는지 분명해집니다.
 
-**재난문자 켜기**: `.env`에 `CBS_SERVICE_KEY`를 넣고 컨테이너를 재시작하면 켜집니다 (예전 `.env`에 `DISASTER_ENABLED=false`가 남아 있으면 지우거나 `true`로 바꾸세요).
+**재난문자 켜기**: `.env`에 `CBS_SERVICE_KEY`를 넣고 컨테이너를 **다시 만들면** 켜집니다 (예전 `.env`에 `DISASTER_ENABLED=false`가 남아 있으면 지우거나 `true`로 바꾸세요).
+- `.env`는 컨테이너를 **생성할 때만** 읽힙니다. Container Manager의 '재시작'이나 `docker restart`로는 반영되지 않으니 `sudo docker compose up -d --force-recreate`를 쓰세요.
+- 그래도 꺼져 있으면 컨테이너 로그를 확인하세요. 시작할 때 `재난문자 기능 비활성화: <이유>`(키 없음 / 이름 앞뒤 공백 / `DISASTER_ENABLED=false`)와 `로그인: … (v1.2.1, 재난문자 켜짐|꺼짐)`이 출력됩니다. 버전 표시가 없으면 예전 이미지가 돌고 있는 것입니다.
 
 ### 이미지 게시 (개발 PC)
 ```sh
