@@ -88,6 +88,8 @@ class EqkReport:
     intensity: str
     img: str
     rem: str
+    official: bool = True      # False = PEWS 자동 분석 (비공식)
+    label: str = ""            # 종류 표시를 바꿀 때 (PEWS)
 
     @property
     def key(self) -> str:
@@ -104,7 +106,7 @@ class EqkReport:
 
     @property
     def kind(self) -> str:
-        return FC_TP.get(self.fc_tp, f"통보종류 {self.fc_tp}")
+        return self.label or FC_TP.get(self.fc_tp, f"통보종류 {self.fc_tp}")
 
 
 def group_quakes(reports: list[EqkReport], window_s: int = 90) -> list["EqkEvent"]:
@@ -133,10 +135,11 @@ class EqkEvent:
 
     @property
     def best(self) -> EqkReport | None:
-        """상세(수동분석) 통보 우선, 그 중 가장 최근 발표."""
+        """공식 발표 우선(PEWS 는 공식 발표가 오기 전까지만), 그 다음 상세(수동분석), 가장 최근 발표."""
         if not self.reports:
             return None
-        return max(self.reports, key=lambda r: (r.fc_tp in DETAILED_FC, r.tm_fc.timestamp() if r.tm_fc else 0))
+        return max(self.reports, key=lambda r: (r.official, r.fc_tp in DETAILED_FC,
+                                                r.tm_fc.timestamp() if r.tm_fc else 0))
 
     @property
     def has_detail(self) -> bool:

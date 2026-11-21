@@ -3,20 +3,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 import time
 
-import aiohttp
 import discord
 from discord import app_commands
 
-from . import __version__, render, timeutil
+from . import __version__, render, safetydb, timeutil
 from .config import Config
 from .dispatcher import Dispatcher
 from .disaster_commands import build_disaster_commands
 from .eqk_commands import build_eqk_commands
 from .models import EQK_LEVELS, DisasterMsg, EqkReport
-from .pollers import DisasterPoller, EqkPoller
-from .quota import Quota
+from .pollers import CollectorWatch, DisasterPoller, EqkPoller, PewsPoller
 from .storage import Storage
 
 log = logging.getLogger(__name__)
@@ -30,14 +29,12 @@ class AlertBot(discord.Client):
         self.cfg = cfg
         self.tree = app_commands.CommandTree(self)
         self.storage = Storage(cfg.db_path)
-        self.session: aiohttp.ClientSession | None = None
+        safetydb.DB = cfg.safety_db
         self.dispatcher = Dispatcher(self, self.storage, cfg.admin_channel_id)
-        self.eqk_quota = Quota(self.storage, "eqk", cfg.eqk_daily_limit, cfg.eqk_reserve,
-                               cfg.min_interval, cfg.max_interval)
-        self.disaster_quota = Quota(self.storage, "disaster", cfg.disaster_daily_limit,
-                                    cfg.disaster_reserve, cfg.min_interval, cfg.max_interval)
-        self.eqk_poller: EqkPoller | None = None
-        self.disaster_poller: DisasterPoller | None = None
+        self.eqk_poller = EqkPoller(self.storage, self.dispatcher, cfg.stale_minutes)
+        self.disaster_poller = DisasterPoller(self.storage, self.dispatcher, cfg.stale_minutes)
+        self.pews_poller = PewsPoller(self.storage, self.dispatcher, cfg.stale_minutes)
+        self.watch = CollectorWatch(self.dispatcher)
         self._tasks: list[asyncio.Task] = []
         self.tree.add_command(build_commands(self))
         self.tree.add_command(build_eqk_commands(self))
@@ -45,17 +42,11 @@ class AlertBot(discord.Client):
 
     async def setup_hook(self) -> None:
         await self.storage.open()
-        self.session = aiohttp.ClientSession(headers={"User-Agent": "disaster-alert-bot/1.0"})
-        self.eqk_poller = EqkPoller(self.session, self.storage, self.eqk_quota, self.dispatcher,
-                                    self.cfg.data_go_kr_key, self.cfg.stale_minutes)
-        self.disaster_poller = DisasterPoller(self.session, self.storage, self.disaster_quota,
-                                              self.dispatcher, self.cfg.safety_key,
-                                              self.cfg.stale_minutes)
-        self.dispatcher.request_eqk_burst = self.eqk_poller.burst_for
-        if cfg_on(self):
-            self.dispatcher.request_disaster_burst = self.disaster_poller.burst_short
-        else:
-            log.warning("재난문자 기능 비활성화: %s — 지진정보만 동작", self.cfg.disaster_off_reason)
+        log.info("공용 수집기 DB(읽기 전용): %s", self.cfg.safety_db)
+        if not cfg_on(self):
+            log.warning("재난문자 기능 비활성화: DISASTER_ENABLED=false — 지진정보만 동작")
+        if self.cfg.pews_enabled:
+            log.info("PEWS 실시간 감지 사용 (공식 발표 전 자동 분석값으로 먼저 공지)")
         await self.tree.sync()
 
     async def on_ready(self) -> None:
@@ -64,9 +55,21 @@ class AlertBot(discord.Client):
         for g in self.guilds:
             await self.storage.ensure_guild(g.id, g.name)
         if not self._tasks:   # 재연결 시 중복 실행 방지
-            self._tasks = [asyncio.create_task(self.eqk_poller.run(), name="eqk")]
+            self._tasks = [asyncio.create_task(self.eqk_poller.run(), name="eqk"),
+                           asyncio.create_task(self.watch.run(), name="collector-watch"),
+                           asyncio.create_task(self._maintenance(), name="maintenance")]
             if cfg_on(self):
                 self._tasks.append(asyncio.create_task(self.disaster_poller.run(), name="disaster"))
+            if self.cfg.pews_enabled:
+                self._tasks.append(asyncio.create_task(self.pews_poller.run(), name="pews"))
+
+    async def _maintenance(self) -> None:
+        while True:
+            try:
+                await self.storage.prune()
+            except Exception:       # noqa: BLE001
+                log.exception("오래된 기록 정리 실패")
+            await asyncio.sleep(86400)
 
     # ---- 서버 수명주기 ----
     async def on_guild_join(self, guild: discord.Guild) -> None:
@@ -89,8 +92,6 @@ class AlertBot(discord.Client):
     async def close(self) -> None:
         for t in self._tasks:
             t.cancel()
-        if self.session:
-            await self.session.close()
         await self.storage.close()
         await super().close()
 
@@ -176,16 +177,29 @@ async def dashboard_embed(bot: AlertBot, guild: discord.Guild) -> discord.Embed:
 
     # 봇 공통 상태
     lines = []
+    try:
+        meta = await asyncio.to_thread(safetydb.meta)
+    except sqlite3.Error:
+        meta = {}
+    w = bot.watch
+    hb = meta.get("heartbeat")
+    w_state = "🟢" if w.healthy else ("🔴" if w.alerted or w.lag is not None else "⚪")
+    line = f"{w_state} **수집기** heartbeat {_ago(hb.timestamp() if hb else None)}"
+    if w.error:
+        line += f"\n　└ {w.error[:100]}"
+    lines.append(line)
     if not cfg_on(bot):
         lines.append("⏸️ **재난문자(행안부)** 비활성화 — 지진정보만 공지")
-    pairs = ((bot.disaster_poller, bot.disaster_quota),) if cfg_on(bot) else ()
-    for p, q in pairs + ((bot.eqk_poller, bot.eqk_quota),):
-        used = await q.used()
-        nxt = await q.next_interval()
-        state = "🟢" if p and p.last_ok and not p.last_error else ("🔴" if p and p.last_error else "⚪")
-        line = (f"{state} **{p.name if p else '?'}** {used}/{q.limit}회 · "
-                f"주기 {nxt:.0f}초 · 최근 성공 {_ago(p.last_ok if p else None)}")
-        if p and p.last_error:
+    pollers = [(bot.disaster_poller, "last_poll:cbs")] if cfg_on(bot) else []
+    pollers.append((bot.eqk_poller, "last_poll:eqk"))
+    if bot.cfg.pews_enabled:
+        pollers.append((bot.pews_poller, "pews_heartbeat"))
+    for p, key in pollers:
+        state = "🟢" if p.last_ok and not p.last_error else ("🔴" if p.last_error else "⚪")
+        polled = meta.get(key)
+        line = (f"{state} **{p.name}** 수집 {_ago(polled.timestamp() if polled else None)} · "
+                f"봇 확인 {_ago(p.last_ok)} · 커서 #{p.cursor if p.cursor is not None else '-'}")
+        if p.last_error:
             line += f"\n　└ {p.last_error[:100]}"
         lines.append(line)
     total, active_n = await bot.storage.count_guilds()

@@ -1,17 +1,24 @@
 # 재난알림봇 — Synology Container Manager 용
 # 이 파일과 같은 폴더에 .env 를 두세요 (.env.example 참고)
+# 공공 API 는 같은 NAS 의 safety-collector 가 호출하고, 봇은 그 DB 를 읽기만 합니다.
 services:
   disaster-alert-bot:
     image: quesogato3924/disaster-alert-bot:latest
     container_name: disaster-alert-bot
     restart: unless-stopped
+    # safety-collector/.env 의 PUID:PGID 와 같게 (수집기 DB 는 660 으로 만들어짐)
+    user: "${PUID:-1000}:${PGID:-1000}"
     env_file:
       - .env
     environment:
       TZ: Asia/Seoul
       DB_PATH: /app/data/bot.db
+      SAFETY_DB: /data/safety.db
     volumes:
-      - ./data:/app/data          # 서버 설정 · 발송기록 · API 사용량 (SQLite)
+      - ./data:/app/data          # 봇 자신의 DB: 서버 설정 · 발송기록 · 커서 (SQLite)
+      # 공용 수집기 DB. :ro 로 붙이지 말 것 — WAL 은 읽기만 해도 safety.db-shm 에 써야 함.
+      # 쓰기 방지는 코드의 mode=ro 가 맡음
+      - /volume1/docker/safety-collector/data:/data
     logging:
       driver: json-file
       options:

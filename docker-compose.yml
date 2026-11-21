@@ -4,12 +4,16 @@ services:
     image: quesogato3924/disaster-alert-bot:latest
     container_name: disaster-alert-bot
     restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"   # safety-collector 와 같은 계정
     env_file: .env
     environment:
       TZ: Asia/Seoul
       DB_PATH: /app/data/bot.db
+      SAFETY_DB: /data/safety.db
     volumes:
       - ./data:/app/data
+      # 공용 수집기 DB 폴더 (:ro 금지 — WAL 은 읽기에도 -shm 쓰기가 필요)
+      - ${SAFETY_DATA_DIR:-./safety-data}:/data
     logging:
       driver: json-file
       options:

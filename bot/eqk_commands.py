@@ -1,14 +1,16 @@
 """/지진정보 — 관리자가 최근 지진정보를 채널에 공개 공지."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import sqlite3
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import discord
 from discord import app_commands
 
-from . import render, timeutil
+from . import render, safetydb, timeutil
 from .models import group_quakes
 
 if TYPE_CHECKING:
@@ -28,16 +30,21 @@ def build_eqk_commands(bot: "AlertBot") -> app_commands.Group:
     async def load(inter: discord.Interaction, scope: str):
         """공개 응답으로 defer 후 (지진 목록, 하단 문구) 반환. 실패 시 None."""
         await inter.response.defer(thinking=True)          # 공개(ephemeral 아님)
-        reports, fetched_at, fresh = await bot.eqk_poller.recent_reports()
-        if not fetched_at:
+        try:
+            reports = await asyncio.to_thread(safetydb.recent_quake_reports, 3)
+            polled = (await asyncio.to_thread(safetydb.meta)).get("last_poll:eqk")
+        except sqlite3.Error as e:
+            log.warning("수동 지진정보 조회 실패: %s", e)
             await inter.followup.send("⚠️ 기상청 지진정보를 불러오지 못했습니다. 잠시 후 다시 시도해주세요.")
             return None
         if scope == "국내":
             reports = [r for r in reports if r.domestic]
         events = group_quakes(reports)
-        age = int(timeutil.now().timestamp() - fetched_at)
-        footer = f"기상청 지진정보 · {inter.user.display_name} 님 요청 · {age // 60}분 {age % 60}초 전 조회"
-        if not fresh:
+        footer = f"기상청 지진정보 · {inter.user.display_name} 님 요청"
+        if polled:
+            age = max(0, int(timeutil.now().timestamp() - polled.timestamp()))
+            footer += f" · {age // 60}분 {age % 60}초 전 조회"
+        if not bot.watch.healthy:
             footer += " (최신 조회 실패 — 이전 데이터)"
         return events, footer
 

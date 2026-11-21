@@ -6,7 +6,8 @@ LABEL org.opencontainers.image.title="disaster-alert-bot" \
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TZ=Asia/Seoul \
-    DB_PATH=/app/data/bot.db
+    DB_PATH=/app/data/bot.db \
+    SAFETY_DB=/data/safety.db
 
 WORKDIR /app
 COPY requirements.txt .

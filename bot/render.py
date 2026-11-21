@@ -39,7 +39,10 @@ def _mag_color(r: EqkReport) -> int:
 def eqk_embed(r: EqkReport) -> discord.Embed:
     title = f"🌏 {r.kind} — {r.loc}"
     desc = None
-    if r.fc_tp in PRELIMINARY_FC:
+    if not r.official:
+        desc = ("⏳ 기상청 PEWS 화면의 자동 분석값입니다 (비공식). "
+                "기상청 공식 발표가 나오면 이 메시지가 갱신됩니다.")
+    elif r.fc_tp in PRELIMINARY_FC:
         desc = "⏳ 자동 추정 정보입니다. 기상청 상세 분석 결과가 나오면 이 메시지가 갱신됩니다."
     e = discord.Embed(title=title[:256], description=desc, color=_mag_color(r),
                       url=KMA_EQK_PAGE, timestamp=r.tm_eqk)
@@ -57,7 +60,10 @@ def eqk_embed(r: EqkReport) -> discord.Embed:
         e.add_field(name="참고사항", value=_clip(r.rem, 1024), inline=False)
     if r.img:
         e.set_image(url=r.img)
-    e.set_footer(text=f"기상청 · 발표 {timeutil.fmt(r.tm_fc)}")
+    if r.official:
+        e.set_footer(text=f"기상청 · 발표 {timeutil.fmt(r.tm_fc)}")
+    else:
+        e.set_footer(text=f"기상청 PEWS 자동 분석 (비공식) · 감지 {timeutil.fmt(r.tm_fc)}")
     return e
 
 

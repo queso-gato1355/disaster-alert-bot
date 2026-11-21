@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 KST = ZoneInfo("Asia/Seoul")
@@ -12,12 +12,6 @@ def now() -> datetime:
 
 def ymd(dt: datetime | None = None) -> str:
     return (dt or now()).strftime("%Y%m%d")
-
-
-def seconds_until_midnight(dt: datetime | None = None) -> float:
-    dt = dt or now()
-    tomorrow = (dt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    return (tomorrow - dt).total_seconds()
 
 
 _FORMATS = (

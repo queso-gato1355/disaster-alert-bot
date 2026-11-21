@@ -5,8 +5,8 @@
 - guild_regions   서버별 수신지역 키워드 (없으면 전국 수신)
 - guild_mentions  서버별 멘션 역할 (kind: 위급재난/긴급재난/안전안내/지진)
 - deliveries      서버별 발송 기록 (대시보드 '최근 공지', 통계)
-- seen            API 항목 중복 제거 (전 서버 공통)
-- quota           API 일일 호출 수 (전 서버 공통 - API 호출은 서버 수와 무관하게 1회)
+- seen            재난문자 SN 중복 제거 (전 서버 공통)
+- cursors         공용 수집기 DB 테이블별로 마지막으로 알린 id (전 서버 공통)
 
 스키마 버전은 PRAGMA user_version 으로 관리하고 MIGRATIONS 를 순서대로 적용한다.
 """
@@ -73,6 +73,15 @@ MIGRATIONS: list[str] = [
     """
     ALTER TABLE guilds ADD COLUMN eqk_level INTEGER NOT NULL DEFAULT 2;
     UPDATE guilds SET eqk_level = 0 WHERE eqk_domestic_min >= 10 AND eqk_overseas_min >= 10;
+    """,
+    # v3: 공공 API 직접 호출 → 공용 수집기(safety-collector) DB 읽기. 호출 한도 기록은 필요 없음
+    """
+    CREATE TABLE IF NOT EXISTS cursors (
+        name       TEXT PRIMARY KEY,          -- 수집기 테이블 이름 (cbs / eqk_reports / pews_events)
+        last_id    INTEGER NOT NULL,
+        updated_at REAL NOT NULL
+    );
+    DROP TABLE IF EXISTS quota;
     """,
 ]
 
@@ -142,26 +151,20 @@ class Storage:
         await self.db.execute("DELETE FROM seen WHERE seen_at < ?", (now - days * 86400,))
         await self.db.execute("DELETE FROM deliveries WHERE sent_at < ?",
                               (now - delivery_days * 86400,))
-        await self.db.execute(
-            "DELETE FROM quota WHERE ymd < strftime('%Y%m%d', 'now', ?)", (f"-{days} days",))
         await self.db.commit()
 
-    # ------------------------------------------------------------ quota
-    async def quota_get(self, api: str, ymd: str) -> int:
-        async with self.db.execute(
-            "SELECT count FROM quota WHERE api=? AND ymd=?", (api, ymd)
-        ) as cur:
+    # ------------------------------------------------------------ cursors
+    async def cursor_get(self, name: str) -> int | None:
+        async with self.db.execute("SELECT last_id FROM cursors WHERE name=?", (name,)) as cur:
             row = await cur.fetchone()
-        return row[0] if row else 0
+        return row[0] if row else None
 
-    async def quota_incr(self, api: str, ymd: str) -> int:
+    async def cursor_set(self, name: str, last_id: int) -> None:
         await self.db.execute(
-            "INSERT INTO quota(api, ymd, count) VALUES (?,?,1) "
-            "ON CONFLICT(api, ymd) DO UPDATE SET count = count + 1",
-            (api, ymd),
-        )
+            "INSERT INTO cursors(name, last_id, updated_at) VALUES (?,?,?) "
+            "ON CONFLICT(name) DO UPDATE SET last_id=excluded.last_id, updated_at=excluded.updated_at",
+            (name, last_id, time.time()))
         await self.db.commit()
-        return await self.quota_get(api, ymd)
 
     # ------------------------------------------------------------ guilds
     async def ensure_guild(self, guild_id: int, name: str = "") -> None:

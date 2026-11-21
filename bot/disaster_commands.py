@@ -1,14 +1,15 @@
-"""/재난문자 — 관리자가 최근 재난문자를 채널에 공개 공지 (자동 조회 결과를 사용, 추가 API 호출 없음)."""
+"""/재난문자 — 관리자가 최근 재난문자를 채널에 공개 공지 (공용 수집기 DB 에서 최근 24시간 조회)."""
 from __future__ import annotations
 
+import asyncio
 import logging
-import time
+import sqlite3
 from typing import TYPE_CHECKING
 
 import discord
 from discord import app_commands
 
-from . import render, timeutil
+from . import render, safetydb, timeutil
 from .dispatcher import region_matches
 from .models import DisasterMsg
 
@@ -31,23 +32,26 @@ def build_disaster_commands(bot: "AlertBot") -> app_commands.Group:
 
     async def load(inter: discord.Interaction, 지역: str | None):
         """(문자 목록, 하단 문구) 반환. 사용할 수 없으면 안내 후 None."""
-        p = bot.disaster_poller
-        if not bot.cfg.disaster_enabled or p is None:
+        if not bot.cfg.disaster_enabled:
             await inter.response.send_message("⏸️ 재난문자 기능이 꺼져 있습니다.", ephemeral=True)
             return None
-        if not p.last_ok and not p.cache:
+        try:
+            recent = await asyncio.to_thread(safetydb.recent_cbs, 24)
+            polled = (await asyncio.to_thread(safetydb.meta)).get("last_poll:cbs")
+        except sqlite3.Error as e:
+            log.warning("수동 재난문자 조회 실패: %s", e)
             await inter.response.send_message(
-                "⏳ 아직 재난문자를 조회하지 못했습니다. 잠시 후 다시 시도해주세요.", ephemeral=True)
+                "⏳ 지금은 재난문자를 불러올 수 없습니다. 잠시 후 다시 시도해주세요.", ephemeral=True)
             return None
         await inter.response.defer(thinking=True)          # 공개(ephemeral 아님)
         g = await bot.storage.guild(inter.guild_id)
-        msgs = [m for m in p.recent() if _region_match(m, 지역)
+        msgs = [m for m in recent if _region_match(m, 지역)
                 and (g.include_missing or not m.is_missing_person)]
         footer = f"행정안전부 재난문자 · {inter.user.display_name} 님 요청"
-        if p.last_ok:
-            age = int(time.time() - p.last_ok)
+        if polled:
+            age = max(0, int(timeutil.now().timestamp() - polled.timestamp()))
             footer += f" · {age // 60}분 {age % 60}초 전 조회"
-        if p.last_error:
+        if not bot.watch.healthy:
             footer += " (최신 조회 실패 — 이전 데이터)"
         return msgs, footer
 

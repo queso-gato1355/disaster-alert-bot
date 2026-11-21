@@ -5,12 +5,10 @@ import asyncio
 import itertools
 import logging
 from datetime import timedelta
-from typing import Callable
-
 import discord
 
 from . import render, timeutil
-from .models import EQK_LEVELS, DisasterMsg, EqkEvent, EqkReport, PRELIMINARY_FC
+from .models import EQK_LEVELS, DisasterMsg, EqkEvent, EqkReport
 from .storage import GuildConfig, Storage
 
 log = logging.getLogger(__name__)
@@ -92,9 +90,6 @@ class Dispatcher:
         self._ids = itertools.count(1)
         self._lock = asyncio.Lock()
         self._sem = asyncio.Semaphore(10)
-        # pollers 가 연결됨 (순환 참조 회피용 콜백)
-        self.request_eqk_burst: Callable[[EqkEvent], None] = lambda ev: None
-        self.request_disaster_burst: Callable[[], None] = lambda: None
 
     # ------------------------------------------------------------ 입력
     async def handle_disaster(self, m: DisasterMsg) -> None:
@@ -103,8 +98,6 @@ class Dispatcher:
                 ev = self._event_for_msg(m)
                 ev.messages.append(m)
                 await self._publish_event(ev)
-                if not ev.has_detail:
-                    self.request_eqk_burst(ev)
                 return
             targets = [g for g in await self.storage.active_guilds() if msg_passes(g, m)]
             title = f"[{m.step}] {m.category}: {m.content[:60]}"
@@ -118,10 +111,6 @@ class Dispatcher:
             if ev.tm_eqk is None:
                 ev.tm_eqk = r.tm_eqk
             await self._publish_event(ev)
-            if r.fc_tp in PRELIMINARY_FC and not ev.has_detail:
-                self.request_eqk_burst(ev)
-            if r.domestic and (r.mt or 0) >= 3.5:
-                self.request_disaster_burst()
 
     # ------------------------------------------------------------ 이벤트 매칭
     def _gc(self) -> None:

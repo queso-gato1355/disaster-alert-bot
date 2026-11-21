@@ -1,249 +1,212 @@
-"""두 API 를 각자의 호출 한도 안에서 주기적으로 조회."""
+"""공용 수집기 DB 를 id 커서로 짧게 주기 조회해 새 항목을 알림.
+
+- DB 조회는 공짜이므로 한도/백오프 없이 고정 주기 (재난문자·지진 5초, PEWS 2초).
+- 커서(마지막으로 알린 id)는 봇 자신의 DB(cursors 테이블)에 둔다. 처음엔 MAX(id) 에서 시작.
+- 알림을 보낸 뒤에 커서를 올린다. 처리 중 예외가 나면 다음 주기에 다시 시도하고,
+  같은 행이 MAX_TRIES 번 실패하면 관리자에게 알리고 건너뛴다.
+- DB 가 없거나 잠겨 있으면(sqlite3.Error) 이번 회차만 건너뛴다.
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 import time
 from datetime import timedelta
 
-import aiohttp
-
-from . import apis, timeutil
+from . import safetydb, timeutil
 from .dispatcher import Dispatcher
-from .models import DisasterMsg, EqkEvent, EqkReport
-from .quota import Quota
 from .storage import Storage
 
 log = logging.getLogger(__name__)
 
-ALERT_AFTER_FAILS = 5
+MAX_TRIES = 3
 
 
 class Poller:
     name = "poller"
-    source = ""
+    table = ""
+    interval = 5.0
 
-    def __init__(self, session: aiohttp.ClientSession, storage: Storage, quota: Quota,
-                 dispatcher: Dispatcher, key: str, stale_minutes: int):
-        self.session = session
+    def __init__(self, storage: Storage, dispatcher: Dispatcher, stale_minutes: int):
         self.storage = storage
-        self.quota = quota
         self.dispatcher = dispatcher
-        self.key = key
         self.stale = timedelta(minutes=stale_minutes)
-        self._wake = asyncio.Event()
-        self._last_poll = 0.0
-        self._backoff_until = 0.0
-        self._burst_until = 0.0
-        self._burst_interval = 0.0
-        self._burst_done = lambda: False
-        self._day = timeutil.ymd()
+        self.cursor: int | None = None
         # 상태 표시용
-        self.fails = 0
         self.last_ok: float | None = None
         self.last_error: str | None = None
-        self._alerted = False
+        self._fail_id: int | None = None
+        self._fail_n = 0
 
-    # ---------------------------------------------------------- burst
-    def burst(self, seconds: float, interval: float, done=lambda: False) -> None:
-        self._burst_until = max(self._burst_until, time.time() + seconds)
-        self._burst_interval = interval
-        self._burst_done = done
-        self._wake.set()
-
-    def _in_burst(self) -> bool:
-        return time.time() < self._burst_until and not self._burst_done()
-
-    # ---------------------------------------------------------- loop
-    async def _next_wait(self) -> float:
-        now = time.time()
-        if now < self._backoff_until:
-            return self._backoff_until - now
-        interval = await self.quota.next_interval()
-        if self._in_burst():
-            interval = min(interval, self._burst_interval)
-        return max(0.0, self._last_poll + interval - now)
-
-    async def run(self) -> None:
-        if not self.key:
-            log.error("%s: API 키가 없어 비활성화됨", self.name)
-            self.last_error = "API 키 없음"
-            return
-        while True:
-            if timeutil.ymd() != self._day:
-                self._day = timeutil.ymd()
-                self.quota.reset_day()
-                await self.storage.prune()
-            wait = await self._next_wait()
-            try:
-                await asyncio.wait_for(self._wake.wait(), timeout=wait)
-                self._wake.clear()
-                continue        # 깨어났으면 대기시간 재계산
-            except asyncio.TimeoutError:
-                pass
-            if not await self.quota.acquire(burst=self._in_burst()):
-                self._last_poll = time.time()
-                continue
-            self._last_poll = time.time()
-            try:
-                await self.poll()
-                await self._ok()
-            except apis.ApiError as e:
-                await self._fail(e, e.limit_exceeded, e.fatal)
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                await self._fail(e, False, False)
-            except Exception as e:      # noqa: BLE001 - 루프는 죽지 않아야 함
-                log.exception("%s: 예상치 못한 오류", self.name)
-                await self._fail(e, False, False)
-
-    async def _ok(self) -> None:
-        if self._alerted:
-            await self.dispatcher.admin(f"{self.name}: 정상 복구됨")
-        self.fails = 0
-        self._alerted = False
-        self.last_ok = time.time()
-        self.last_error = None
-
-    async def _fail(self, e: Exception, limit: bool, fatal: bool) -> None:
-        self.fails += 1
-        self.last_error = str(e)
-        log.warning("%s 실패(%d회 연속): %s", self.name, self.fails, e)
-        if limit:
-            self.quota.exhausted_until_midnight = True
-            self._backoff_until = time.time() + timeutil.seconds_until_midnight() + 5
-        elif fatal:
-            self._backoff_until = time.time() + 3600
-        else:
-            self._backoff_until = time.time() + min(600, 30 * 2 ** (self.fails - 1))
-        if (fatal or limit or self.fails >= ALERT_AFTER_FAILS) and not self._alerted:
-            self._alerted = True
-            await self.dispatcher.admin(f"{self.name}: API 오류 — {e}")
-
-    async def _is_new(self, key: str) -> bool:
-        if await self.storage.is_seen(self.source, key):
-            return False
-        await self.storage.mark_seen(self.source, key)
-        return True
-
-    async def poll(self) -> None:
+    # ---------------------------------------------------------- 하위 클래스
+    def fetch(self, last_id: int) -> list[dict]:
         raise NotImplementedError
 
+    async def handle(self, row: dict) -> None:
+        raise NotImplementedError
 
-class EqkPoller(Poller):
-    name = "지진정보(기상청)"
-    source = "eqk"
+    # ---------------------------------------------------------- loop
+    async def run(self) -> None:
+        while True:
+            try:
+                await self.tick()
+                if self.last_error:
+                    log.info("%s: 수집기 DB 조회 정상화", self.name)
+                self.last_ok, self.last_error = time.time(), None
+            except sqlite3.Error as e:          # DB 없음/잠김/권한 → 다음 주기에 다시
+                if self.last_error != str(e):
+                    log.warning("%s: 수집기 DB 조회 실패 (다음 주기에 재시도): %s", self.name, e)
+                self.last_error = str(e)
+            except Exception as e:              # noqa: BLE001 - 루프는 죽지 않아야 함
+                log.exception("%s: 예상치 못한 오류", self.name)
+                self.last_error = str(e)
+            await asyncio.sleep(self.interval)
 
-    # 수동 조회 명령이 이 값보다 최근 캐시가 있으면 API 를 호출하지 않음
-    CACHE_TTL = 120
+    async def _load_cursor(self) -> int:
+        saved = await self.storage.cursor_get(self.table)
+        if saved is None:
+            saved = await asyncio.to_thread(safetydb.max_id, self.table)
+            await self.storage.cursor_set(self.table, saved)
+            log.info("%s: 커서 시작값 %d (MAX(id), 지난 항목은 알리지 않음)", self.name, saved)
+        return saved
 
-    def __init__(self, *a, **kw):
-        super().__init__(*a, **kw)
-        self.cache: list[EqkReport] = []
-        self.cache_at: float = 0.0
-        self._fetch_lock = asyncio.Lock()
+    async def tick(self) -> None:
+        if self.cursor is None:
+            self.cursor = await self._load_cursor()
+        rows = await asyncio.to_thread(self.fetch, self.cursor)
+        if not rows:
+            # 수집기 DB 를 새로 만들어 id 가 처음부터 다시 시작한 경우
+            top = await asyncio.to_thread(safetydb.max_id, self.table)
+            if top < self.cursor:
+                log.warning("%s: 수집기 DB 의 MAX(id)=%d 가 커서 %d 보다 작음 → 커서 재설정",
+                            self.name, top, self.cursor)
+                await self._advance(top)
+            return
+        for row in rows:
+            try:
+                await self.handle(row)
+            except Exception as e:              # noqa: BLE001
+                if not await self._handle_failed(row, e):
+                    return                      # 다음 주기에 이 행부터 다시
+            await self._advance(row["id"])
 
-    async def _fetch(self) -> list[EqkReport]:
-        reports = await apis.fetch_eqk(self.session, self.key)
-        self.cache, self.cache_at = reports, time.time()
-        return reports
+    async def _advance(self, new_id: int) -> None:
+        self.cursor = new_id
+        await self.storage.cursor_set(self.table, new_id)
 
-    async def recent_reports(self) -> tuple[list[EqkReport], float, bool]:
-        """수동 조회용. (통보 목록, 조회 시각, 최신 여부).
-        캐시가 오래됐으면 예비분 안에서 1회 호출하고, 실패/한도 부족 시 캐시를 반환."""
-        async with self._fetch_lock:
-            if time.time() - self.cache_at <= self.CACHE_TTL:
-                return self.cache, self.cache_at, True
-            if self.key and await self.quota.acquire(burst=True):
-                try:
-                    await self._fetch()
-                    return self.cache, self.cache_at, True
-                except Exception as e:      # noqa: BLE001
-                    log.warning("수동 지진정보 조회 실패: %s", e)
-            return self.cache, self.cache_at, False
-
-    def burst_for(self, ev: EqkEvent) -> None:
-        """상세정보가 들어올 때까지 20초 간격, 최대 10분."""
-        self.burst(600, 20, done=lambda: ev.has_detail)
-
-    async def poll(self) -> None:
-        async with self._fetch_lock:
-            reports = list(await self._fetch())
-        reports.sort(key=lambda r: (r.tm_fc.timestamp() if r.tm_fc else 0, r.tm_seq))
-        now = timeutil.now()
-        for r in reports:
-            if not await self._is_new(r.key):
-                continue
-            if r.tm_fc and now - r.tm_fc > self.stale * 2:
-                continue        # 재시작 등으로 놓친 오래된 통보는 공지하지 않음
-            log.info("새 지진통보: %s %s M%s", r.kind, r.loc, r.mt)
-            await self.dispatcher.handle_eqk(r)
+    async def _handle_failed(self, row: dict, e: Exception) -> bool:
+        """True = 이 행을 건너뜀."""
+        if row["id"] == self._fail_id:
+            self._fail_n += 1
+        else:
+            self._fail_id, self._fail_n = row["id"], 1
+        log.exception("%s: id=%s 처리 실패 (%d/%d)", self.name, row["id"], self._fail_n, MAX_TRIES)
+        if self._fail_n < MAX_TRIES:
+            return False
+        await self.dispatcher.admin(f"{self.name}: id={row['id']} 처리가 {MAX_TRIES}회 실패해 건너뜀 — {e}")
+        return True
 
 
 class DisasterPoller(Poller):
     name = "재난문자(행안부)"
-    source = "disaster"
-    ROWS = 100
-    MAX_PAGES = 10            # 한 번의 조회에서 읽을 최대 페이지 (하루 1,000건)
-    # REG_YMD 가 CRT_DT 보다 약 10분 늦으므로, 자정 직후엔 전날 문자도 함께 조회
-    # (crtDt 는 '그 날짜 이후' 조건이라 전날 날짜를 주면 오늘 문자도 포함됨)
-    LOOKBACK = timedelta(minutes=30)
-    CACHE_TTL = timedelta(hours=24)
+    table = "cbs"
 
-    def __init__(self, *a, **kw):
-        super().__init__(*a, **kw)
-        # 정렬 순서가 일정하지 않으므로 전체를 읽어야 함.
-        # totalCount 가 그대로면 새 문자가 없으므로 첫 페이지만 확인.
-        self._totals: dict[str, int] = {}
-        self.cache: dict[str, DisasterMsg] = {}     # 수동 조회용 (최근 24시간)
+    def fetch(self, last_id: int) -> list[dict]:
+        return safetydb.new_cbs(last_id)
 
-    def burst_short(self) -> None:
-        """국내 유감지진 발생 시 재난문자를 빨리 받기 위해 45초 간격 15분.
-        (재난문자는 발송 약 10분 뒤에 API 에 반영됨)"""
-        self.burst(900, 45)
-
-    async def poll(self) -> None:
-        crt_dt = timeutil.ymd(timeutil.now() - self.LOOKBACK)
-        msgs = await self._fetch_all(crt_dt)
-        await self._process(msgs)
-
-    async def _fetch_all(self, crt_dt: str) -> list[DisasterMsg]:
-        msgs, total = await apis.fetch_disaster_page(self.session, self.key, crt_dt, 1, self.ROWS)
-        pages = min(self.MAX_PAGES, (total + self.ROWS - 1) // self.ROWS)
-        if pages > 1 and total != self._totals.get(crt_dt):
-            for page in range(2, pages + 1):
-                if not await self.quota.acquire(burst=True):
-                    log.warning("재난문자 %d/%d 페이지: 호출 한도 부족으로 중단", page, pages)
-                    return msgs     # total 을 기록하지 않아 다음 조회 때 다시 읽음
-                more, _ = await apis.fetch_disaster_page(
-                    self.session, self.key, crt_dt, page, self.ROWS)
-                msgs += more
-        self._totals = {crt_dt: total}
-        return msgs
-
-    async def _process(self, msgs: list[DisasterMsg]) -> None:
-        msgs.sort(key=_sn)
-        now = timeutil.now()
-        for m in msgs:
-            self.cache[m.sn] = m
-            if not await self._is_new(m.sn):
-                continue
-            t = m.available_at
-            if t and now - t > self.stale:
-                continue        # 재시작 등으로 놓친 오래된 문자는 공지하지 않음
+    async def handle(self, row: dict) -> None:
+        m = safetydb.to_msg(row)
+        # 새 문자 판별은 id 커서로 하고, SN 은 혹시 모를 중복(이전 API 방식 기록 포함)만 막는다
+        if m.sn and await self.storage.is_seen("disaster", m.sn):
+            return
+        t = m.available_at
+        if t and timeutil.now() - t > self.stale:
+            log.info("오래된 재난문자 건너뜀 SN=%s (%s)", m.sn, timeutil.fmt(t))
+        else:
             log.info("새 재난문자 SN=%s [%s/%s] %s", m.sn, m.step, m.category, m.regions[:40])
             await self.dispatcher.handle_disaster(m)
-        cutoff = now - self.CACHE_TTL
-        self.cache = {k: v for k, v in self.cache.items()
-                      if not v.created or v.created >= cutoff}
-
-    def recent(self) -> list[DisasterMsg]:
-        """수동 조회용. 발송 시각 최신순 (API 호출 없음)."""
-        return sorted(self.cache.values(),
-                      key=lambda m: m.created.timestamp() if m.created else 0, reverse=True)
+        if m.sn:
+            await self.storage.mark_seen("disaster", m.sn)
 
 
-def _sn(m: DisasterMsg):
-    try:
-        return (0, int(m.sn))
-    except ValueError:
-        return (1, m.sn)
+class EqkPoller(Poller):
+    name = "지진정보(기상청)"
+    table = "eqk_reports"
+
+    def fetch(self, last_id: int) -> list[dict]:
+        return safetydb.new_quake_reports(last_id)
+
+    async def handle(self, row: dict) -> None:
+        r = safetydb.to_report(row)
+        if r.tm_fc and timeutil.now() - r.tm_fc > self.stale * 2:
+            log.info("오래된 지진통보 건너뜀 %s %s", r.kind, timeutil.fmt(r.tm_fc))
+            return
+        log.info("새 지진통보: %s %s M%s", r.kind, r.loc, r.mt)
+        await self.dispatcher.handle_eqk(r)
+
+
+class PewsPoller(Poller):
+    name = "PEWS(기상청 실시간)"
+    table = "pews_events"
+    interval = 2.0
+
+    def fetch(self, last_id: int) -> list[dict]:
+        return safetydb.new_pews(last_id)
+
+    async def handle(self, row: dict) -> None:
+        r = safetydb.pews_to_report(row)
+        t = r.tm_eqk or r.tm_fc
+        if t and timeutil.now() - t > self.stale:
+            log.info("오래된 PEWS 감지 건너뜀 %s", timeutil.fmt(t))
+            return
+        log.info("PEWS 감지: phase=%s %s M%s %s", row.get("phase"), r.loc, r.mt, r.intensity)
+        await self.dispatcher.handle_eqk(r)
+
+
+class CollectorWatch:
+    """수집기 heartbeat 감시. 멈춤/복구를 관리자 채널에 한 번씩만 알림."""
+    CHECK = 30
+    LAG_MAX = 300          # heartbeat 가 이보다 오래되면 멈춤
+    NONE_MAX = 600         # heartbeat 를 못 읽는 상태가 이만큼 이어지면 멈춤
+
+    def __init__(self, dispatcher: Dispatcher):
+        self.dispatcher = dispatcher
+        self.lag: float | None = None
+        self.error: str | None = None
+        self.alerted = False
+        self._none_since: float | None = None
+
+    @property
+    def healthy(self) -> bool:
+        return self.lag is not None and self.lag <= self.LAG_MAX
+
+    async def run(self) -> None:
+        while True:
+            try:
+                await self.check()
+            except Exception:                   # noqa: BLE001
+                log.exception("수집기 감시 오류")
+            await asyncio.sleep(self.CHECK)
+
+    async def check(self) -> None:
+        try:
+            self.lag = await asyncio.to_thread(safetydb.collector_lag_seconds)
+            self.error = None
+        except sqlite3.Error as e:
+            self.lag, self.error = None, str(e)
+        now = time.time()
+        if self.lag is None:
+            self._none_since = self._none_since or now
+            bad = now - self._none_since > self.NONE_MAX
+        else:
+            self._none_since = None
+            bad = self.lag > self.LAG_MAX
+        if bad and not self.alerted:
+            self.alerted = True
+            why = (f"heartbeat {self.lag / 60:.0f}분 전" if self.lag is not None
+                   else f"heartbeat 를 읽을 수 없음 ({self.error or '값 없음'})")
+            await self.dispatcher.admin(f"⚠️ 수집기(safety-collector) 멈춤 — {why}. 새 재난문자·지진 알림이 오지 않습니다.")
+        elif self.alerted and self.healthy:
+            self.alerted = False
+            await self.dispatcher.admin("✅ 수집기(safety-collector) 복구됨")
